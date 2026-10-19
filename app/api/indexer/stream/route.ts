@@ -7,11 +7,19 @@
  * upstream and pipes the response body back verbatim.
  *
  * Query params forwarded transparently: topics, wallet, lastEventId.
+ *
+ * Lifecycle: request.signal is passed to the upstream fetch so that when
+ * the browser closes the connection (tab close, navigation, component
+ * unmount) the upstream SSE connection is aborted immediately rather than
+ * leaking an indexer subscriber slot until a server-side timeout fires
+ * (#1491).
  */
 import { NextRequest } from 'next/server';
 
 const INDEXER_BASE =
-  process.env.NEXT_PUBLIC_INDEXER_API_URL ?? 'http://localhost:3001';
+  process.env.INDEXER_API_URL_INTERNAL ??
+  process.env.NEXT_PUBLIC_INDEXER_API_URL ??
+  'http://localhost:3001';
 
 export const dynamic = 'force-dynamic';
 // Disable body buffering so SSE frames are flushed immediately.
@@ -41,10 +49,19 @@ export async function GET(request: NextRequest): Promise<Response> {
   try {
     upstreamResponse = await fetch(upstream.toString(), {
       headers: upstreamHeaders,
+      // Forward the browser's AbortSignal so the upstream SSE connection is
+      // torn down as soon as the client disconnects (#1491). Without this the
+      // upstream connection stays open until the indexer or the serverless
+      // function times it out, leaking a subscriber slot and a socket.
+      signal: request.signal,
       // @ts-expect-error — Node 18+ fetch supports duplex
       duplex: 'half',
     });
   } catch (err) {
+    // AbortError means the client already disconnected; nothing to send back.
+    if (err instanceof Error && err.name === 'AbortError') {
+      return new Response(null, { status: 499 });
+    }
     return new Response(
       JSON.stringify({ error: 'Indexer stream unavailable' }),
       { status: 502, headers: { 'Content-Type': 'application/json' } },
